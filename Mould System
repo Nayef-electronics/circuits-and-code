@@ -1,0 +1,147 @@
+import time
+import board
+import busio
+import adafruit_dht
+from adafruit_bus_device.i2c_device import I2CDevice
+import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
+import json
+
+# Constants
+THINGSBOARD_HOST = 'thingsboard.cloud'  
+ACCESS_TOKEN = 'eeXTtTZDZXMdDm4S5sna'  
+AC_PIN = 4          # GPIO pin connected to the AC's control input
+VENT_PIN = 21       # GPIO pin connected to the vent
+AC_SPEED = 50       # AC speed as a percentage (50%)
+TEMP_THRESHOLD = 30.0  # Temperature threshold in degrees Celsius
+HUMIDITY_THRESHOLD = 60.0  # Humidity threshold in percentage
+RETRY_ATTEMPTS = 3     # Number of retries for reading the sensor
+AC_RUN_TIME = 10       # Time in seconds to run the AC before checking readings
+
+# DHT22 setup
+dht22 = adafruit_dht.DHT22(board.D17)  # DHT22 sensor on GPIO 17
+
+# DHT20 setup
+i2c = busio.I2C(board.SCL, board.SDA)
+DHT20_ADDRESS = 0x38
+dht20 = I2CDevice(i2c, DHT20_ADDRESS)
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)  # Use BCM numbering
+GPIO.setup(AC_PIN, GPIO.OUT)
+GPIO.setup(VENT_PIN, GPIO.OUT)
+
+# Set up PWM for AC control
+pwm = GPIO.PWM(AC_PIN, 1000)  # 1kHz frequency
+pwm.start(0)  # Start with 0% duty cycle
+# MQTT client setup
+client = mqtt.Client()
+client.username_pw_set(ACCESS_TOKEN)
+client.connect(THINGSBOARD_HOST, 1883, 60)
+client.loop_start()
+
+def read_dht20():
+    try:
+        with dht20:
+            # Send command to read data
+            dht20.write(bytes([0xAC, 0x33, 0x00]))
+            time.sleep(0.1)
+
+            # Read 7 bytes of data back from the sensor
+            result = bytearray(7)
+            dht20.readinto(result)
+
+            # Convert the data into temperature and humidity
+humidity = ((result[1] << 12) | (result[2] << 4) | (result[3] >> 4)>
+            temperature = (((result[3] & 0x0F) << 16) | (result[4] << 8) | resu>
+
+            return temperature, humidity
+    except Exception as e:
+        print(f"Error reading DHT20: {e}. Trying again...")
+        return None, None
+
+def read_dht22():
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            temperature = dht22.temperature
+            humidity = dht22.humidity
+            return temperature, humidity
+        except RuntimeError as error:
+            print(f"Error reading DHT22 (attempt {attempt + 1}): {error}. Retry>
+            time.sleep(1)  # Wait a bit before retrying
+        except OverflowError as overflow_error:
+print(f"OverflowError reading DHT22: {overflow_error}. Trying again>
+            time.sleep(1)  # Wait a bit before retrying
+    return None, None  # If it fails after RETRY_ATTEMPTS, return None
+
+def send_data_to_thingsboard(temp_dht22, hum_dht22, temp_dht20, hum_dht20):
+    telemetry_data = {
+        'temperature_dht22': temp_dht22,
+        'humidity_dht22': hum_dht22,
+        'temperature_dht20': temp_dht20,
+        'humidity_dht20': hum_dht20
+    }
+    client.publish('v1/devices/me/telemetry', json.dumps(telemetry_data), 1)
+
+def send_state_to_thingsboard(vent_state, ac_state):
+    telemetry_data = {
+        'vent_state': vent_state,
+        'ac_state': ac_state
+    }
+
+client.publish('v1/devices/me/telemetry', json.dumps(telemetry_data), 1)
+
+def control_ac_and_vent_based_on_temp_and_humidity():
+    try:
+        while True:
+            # Read temperature and humidity from DHT22 sensor
+            temp_dht22, hum_dht22 = read_dht22()
+            # Read temperature and humidity from DHT20 sensor
+            temp_dht20, hum_dht20 = read_dht20()
+
+            if temp_dht22 is not None and temp_dht20 is not None:
+                print(f"Indoor Conditions - Temperature: {temp_dht22:.1f}°C  Hu>
+                print(f"Outdoor Conditions - Temperature: {temp_dht20:.1f}°C  H>
+
+                # Send data to ThingsBoard
+send_data_to_thingsboard(temp_dht22, hum_dht22, temp_dht20, hum>
+
+                # Activate vent if DHT22 temperature or humidity crosses the th>
+                if temp_dht22 >= TEMP_THRESHOLD or hum_dht22 >= HUMIDITY_THRESH>
+                    GPIO.output(VENT_PIN, GPIO.HIGH)  # Turn on vent
+                    print("Vent OPEN: Indoor temperature or humidity crossed th>
+                    send_state_to_thingsboard(vent_state=True, ac_state=False)
+
+                    # Check DHT20 temperature and humidity and control the AC a>
+                    if temp_dht20 > TEMP_THRESHOLD or hum_dht20 > HUMIDITY_THRE>
+                        GPIO.output(VENT_PIN, GPIO.LOW)  # Turn off vent
+                        pwm.ChangeDutyCycle(AC_SPEED)
+                        print(f"Vent CLOSED. AC running at {AC_SPEED}% speed")
+                        send_state_to_thingsboard(vent_state=False, ac_state=Tr>
+                        time.sleep(AC_RUN_TIME)  # Run AC for a set time
+                    else:
+                        pwm.ChangeDutyCycle(0)
+                        print("AC stopped. Vent remains OPEN")
+send_state_to_thingsboard(vent_state=True, ac_state=Fal>
+                else:
+                    # If DHT22 temperature and humidity are below thresholds, t>
+                    GPIO.output(VENT_PIN, GPIO.LOW)
+                    pwm.ChangeDutyCycle(0)
+                    print("Indoor temperature and humidity below thresholds. Ve>
+                    send_state_to_thingsboard(vent_state=False, ac_state=False)
+            else:
+                print("Failed to retrieve data from one or both sensors.")
+
+            time.sleep(2)  # Delay between reads to reduce load
+
+    except KeyboardInterrupt:
+        print("Program interrupted by user. Exiting...")
+
+    finally:
+        pwm.stop()  # Stop PWM
+        GPIO.cleanup()  # Clean up GPIO
+client.loop_stop()  # Stop the MQTT client loop
+        client.disconnect()  # Disconnect from ThingsBoard
+
+if __name__ == "__main__":
+    control_ac_and_vent_based_on_temp_and_humidity()
